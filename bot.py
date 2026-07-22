@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 
 # ---------- 🔐 YOUR CREDENTIALS (HARDCODED) ----------
-BOT_TOKEN = "YOUR_BOT_TOKEN"                    # ⚠️ Paste your token here
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"                    # ⚠️ Paste your token here
 ADMIN_USER_IDS = {6535041385}                   # Your Telegram user ID (add more if needed)
 # ----------------------------------------------------
 
