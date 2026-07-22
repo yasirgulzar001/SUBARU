@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 
 # ==================== CONFIG ====================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"
 AUTHORIZED_USER = 0  # Your Telegram ID (0 = allow anyone in pvt)
 
 # ==================== BLACKLIST ====================
