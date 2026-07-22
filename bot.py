@@ -17,8 +17,8 @@ from telegram.ext import (
 )
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.environ["BOT_TOKEN"]                     # Required
-ALLOWED_USERS = os.environ.get("ALLOWED_USER_IDS", "")  # Comma-separated, optional
+BOT_TOKEN = os.environ["8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"]                     # Required
+ALLOWED_USERS = os.environ.get("6535041385", "")  # Comma-separated, optional
 if ALLOWED_USERS:
     ALLOWED_USERS = {int(uid) for uid in ALLOWED_USERS.split(",") if uid.strip()}
 
