@@ -1,0 +1,3 @@
+python-telegram-bot==20.7
+curl_cffi
+beautifulsoup4
