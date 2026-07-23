@@ -14,9 +14,15 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
+# Captcha solving imports (install required libs: pip install pytesseract opencv-python pillow)
+import pytesseract
+import cv2
+import numpy as np
+from PIL import Image
+
 # ==================== CONFIG ====================
-BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"
-AUTHORIZED_USER = 0  # Your Telegram ID (0 = allow anyone in pvt)
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"  # <-- replace
+AUTHORIZED_USER = 0  # 0 = allow anyone in private chat
 
 # ==================== BLACKLIST ====================
 BLACKLIST = [
@@ -60,8 +66,6 @@ USER_AGENTS = [
 
 # ==================== TLS ROTATOR ====================
 class InfiniteTLSRotator:
-    """Advanced infinite TLS session rotation - creates fresh fingerprints on demand."""
-
     def __init__(self):
         self._counter = 0
 
@@ -70,7 +74,7 @@ class InfiniteTLSRotator:
         profile = random.choice(TLS_PROFILES)
         session = tls_client.Session(
             client_identifier=profile,
-            random_tls_extension_order=True,  # infinite fingerprint variety
+            random_tls_extension_order=True,
         )
         return session
 
@@ -88,8 +92,161 @@ class InfiniteTLSRotator:
             "Cache-Control": "max-age=0",
         }
 
-
 tls_rotator = InfiniteTLSRotator()
+
+# ==================== CAPTCHA SOLVER ====================
+class CaptchaSolver:
+    """
+    Self‑contained Yahoo captcha solver using Tesseract OCR.
+    Detects the "security check" page, downloads the image, preprocesses it,
+    and submits the answer to obtain valid cookies.
+    """
+    CAPTCHA_SELECTORS = [
+        'form[action*="security"]',
+        'img[src*="captcha"]',
+    ]
+    CAPTCHA_KEYWORDS = ["captcha", "security check", "are you a robot", "sorry"]
+
+    def __init__(self):
+        # Tesseract path (adjust if needed, e.g., r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+        self.tesseract_cmd = pytesseract.pytesseract.tesseract_cmd or 'tesseract'
+
+    def _is_captcha_page(self, html: str) -> bool:
+        """Quick check if page contains captcha markers."""
+        low = html.lower()
+        if any(word in low for word in self.CAPTCHA_KEYWORDS):
+            return True
+        return False
+
+    def _find_captcha_image_url(self, soup: BeautifulSoup, base_url: str) -> str | None:
+        """Locate the captcha image URL from the parsed page."""
+        # Try common Yahoo captcha patterns
+        for img in soup.find_all("img", src=True):
+            src = img["src"]
+            if "captcha" in src.lower() or "challenge" in src.lower():
+                if src.startswith("//"):
+                    return "https:" + src
+                elif src.startswith("/"):
+                    # Build absolute URL
+                    parsed = urlparse(base_url)
+                    return f"{parsed.scheme}://{parsed.netloc}{src}"
+                return src
+        return None
+
+    def _find_form_action(self, soup: BeautifulSoup, base_url: str) -> str | None:
+        """Extract the form action URL where the captcha answer must be submitted."""
+        for form in soup.find_all("form"):
+            if any(word in (form.get("action", "") + str(form)).lower() for word in self.CAPTCHA_KEYWORDS):
+                action = form.get("action")
+                if action:
+                    if action.startswith("//"):
+                        return "https:" + action
+                    elif action.startswith("/"):
+                        parsed = urlparse(base_url)
+                        return f"{parsed.scheme}://{parsed.netloc}{action}"
+                    return action
+        return None
+
+    def _preprocess_image(self, image_bytes: bytes) -> bytes:
+        """
+        Preprocess the captcha image for better OCR:
+        - convert to grayscale
+        - apply adaptive thresholding
+        - remove noise (morphological operations)
+        Returns processed image as bytes (PNG).
+        """
+        # Read from bytes
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return image_bytes  # fallback
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Increase contrast using CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        # Adaptive threshold to binary
+        thresh = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+        # Denoise with morphological opening
+        kernel = np.ones((2, 2), np.uint8)
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        # Convert back to PIL image and save as PNG bytes
+        pil_img = Image.fromarray(255 - cleaned)  # invert back for Tesseract (black text on white)
+        buf = BytesIO()
+        pil_img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _ocr_image(self, image_bytes: bytes) -> str:
+        """Run Tesseract on the (possibly preprocessed) image bytes."""
+        try:
+            processed = self._preprocess_image(image_bytes)
+            img = Image.open(BytesIO(processed))
+            # Configure Tesseract for single‑word alphanumeric captcha
+            custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+            text = pytesseract.image_to_string(img, config=custom_config)
+            return text.strip()
+        except Exception:
+            return ""
+
+    def solve(self, session: tls_client.Session, captcha_html: str, original_url: str) -> bool:
+        """
+        Main solver routine:
+        1. Parse captcha image URL and form action.
+        2. Download the image.
+        3. OCR → answer.
+        4. Submit the answer.
+        Returns True if captcha was solved successfully (cookies set in session).
+        """
+        soup = BeautifulSoup(captcha_html, "html.parser")
+        img_url = self._find_captcha_image_url(soup, original_url)
+        if not img_url:
+            return False
+
+        try:
+            # Download captcha image
+            img_resp = session.get(img_url, headers=tls_rotator.headers(), timeout_seconds=10)
+            if img_resp.status_code != 200:
+                return False
+            image_data = img_resp.content
+        except Exception:
+            return False
+
+        # OCR the image
+        answer = self._ocr_image(image_data)
+        if not answer or len(answer) < 3:
+            return False
+
+        # Find form submission URL
+        form_action = self._find_form_action(soup, original_url)
+        if not form_action:
+            return False
+
+        # Submit the captcha answer
+        data = {
+            "captchaAnswer": answer,  # common Yahoo key
+            "answer": answer,
+            "submit": "Continue",
+        }
+        try:
+            resp = session.post(
+                form_action,
+                data=data,
+                headers=tls_rotator.headers(),
+                timeout_seconds=15,
+                allow_redirects=True,
+            )
+            # After solving, the session cookies should now bypass the check.
+            # A quick heuristic: if the returned page no longer contains captcha markers, success.
+            if not self._is_captcha_page(resp.text):
+                return True
+        except Exception:
+            pass
+        return False
+
+captcha_solver = CaptchaSolver()
 
 # ==================== YAHOO PARSER ====================
 class YahooParser:
@@ -103,7 +260,6 @@ class YahooParser:
         return any(b in low for b in BLACKLIST)
 
     def clean_yahoo_url(self, href):
-        """Extract real URL from Yahoo redirect links."""
         try:
             if "/RU=" in href:
                 m = re.search(r"/RU=([^/]+)/RK=", href)
@@ -116,18 +272,36 @@ class YahooParser:
         return None
 
     def _fetch_page(self, dork, page):
-        """Blocking fetch for one page (runs in thread)."""
         offset = (page * 10) + 1
         query = quote(dork)
         url = f"https://search.yahoo.com/search?p={query}&b={offset}&pz=10"
-        try:
-            session = tls_rotator.new_session()
-            resp = session.get(url, headers=tls_rotator.headers(), timeout_seconds=20)
-            if resp.status_code != 200:
+        session = tls_rotator.new_session()
+
+        max_captcha_retries = 2
+        for attempt in range(max_captcha_retries):
+            try:
+                resp = session.get(url, headers=tls_rotator.headers(), timeout_seconds=20)
+                if resp.status_code != 200:
+                    return []
+
+                html = resp.text
+                # Check if we hit a captcha wall
+                if captcha_solver._is_captcha_page(html):
+                    print(f"[!] Captcha detected for dork='{dork}' page={page}, solving...")
+                    solved = captcha_solver.solve(session, html, url)
+                    if solved:
+                        print("[✓] Captcha solved, retrying request")
+                        continue  # retry the original request with fresh cookies
+                    else:
+                        print("[✗] Captcha solving failed, skipping page")
+                        return []
+
+                return self._extract(html)
+
+            except Exception as e:
+                print(f"Error fetching {url}: {e}")
                 return []
-            return self._extract(resp.text)
-        except Exception:
-            return []
+        return []
 
     def _extract(self, html):
         urls = set()
@@ -141,7 +315,6 @@ class YahooParser:
                 continue
             if self.is_blacklisted(real):
                 continue
-            # normalize
             real = real.strip().rstrip("/")
             urls.add(real)
         return list(urls)
@@ -161,7 +334,6 @@ class YahooParser:
             urls.update(r)
         return urls
 
-
 # ==================== SESSION STATE ====================
 class UserSession:
     def __init__(self):
@@ -174,29 +346,24 @@ class UserSession:
         self.total_dorks = 0
         self.status_msg = None
 
-
 sessions = {}
-
 
 def get_session(uid):
     if uid not in sessions:
         sessions[uid] = UserSession()
     return sessions[uid]
 
-
-# ==================== AUTH ====================
 def authorized(uid):
     return AUTHORIZED_USER == 0 or uid == AUTHORIZED_USER
-
 
 # ==================== COMMANDS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
         return
     text = (
-        "🔎 *Yahoo Mass Dork Parser*\n\n"
+        "🔎 *Yahoo Mass Dork Parser (with Captcha Bypass)*\n\n"
         "⚡ Proxyless | Infinite TLS Rotation\n"
-        "🚀 Handles 20k-30k dorks\n\n"
+        "🧩 Built‑in OCR captcha solver (no API)\n\n"
         "*Commands:*\n"
         "/pages `<n>` - Set max pages (1-50)\n"
         "/status - Show live progress\n"
@@ -207,12 +374,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update.effective_user.id):
-        return
     await start(update, context)
-
 
 async def set_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
@@ -227,7 +390,6 @@ async def set_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Max pages set to *{n}*.", parse_mode="Markdown")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: `/pages 40`", parse_mode="Markdown")
-
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
@@ -244,7 +406,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
         return
@@ -255,13 +416,11 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s.stop_flag = True
     await update.message.reply_text("🛑 Stopping... sending results shortly.")
 
-
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
         return
     sessions[update.effective_user.id] = UserSession()
     await update.message.reply_text("♻️ Session reset.")
-
 
 # ==================== FILE UPLOAD ====================
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,7 +441,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await file.download_as_bytearray()
     raw = data.decode("utf-8", errors="ignore")
     dorks = [d.strip() for d in raw.splitlines() if d.strip()]
-    dorks = list(dict.fromkeys(dorks))  # dedupe
+    dorks = list(dict.fromkeys(dorks))
 
     if not dorks:
         await update.message.reply_text("❌ File is empty.")
@@ -305,7 +464,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb
     )
 
-
 # ==================== SCAN ENGINE ====================
 async def run_scan(context, uid, chat_id):
     s = get_session(uid)
@@ -316,7 +474,7 @@ async def run_scan(context, uid, chat_id):
 
     s.status_msg = await context.bot.send_message(
         chat_id,
-        "🔎 *Scanning...*\n\nInitializing...",
+        "🔎 *Scanning...*\n\nInitializing (captcha bypass active)...",
         parse_mode="Markdown"
     )
 
@@ -331,7 +489,6 @@ async def run_scan(context, uid, chat_id):
         except Exception:
             pass
 
-        # Live update every 2 seconds
         now = time.time()
         if now - last_update > 2:
             last_update = now
@@ -351,7 +508,6 @@ async def run_scan(context, uid, chat_id):
                 pass
 
     await finish_scan(context, uid, chat_id)
-
 
 async def finish_scan(context, uid, chat_id):
     s = get_session(uid)
@@ -376,7 +532,6 @@ async def finish_scan(context, uid, chat_id):
     )
     await context.bot.send_document(chat_id, document=buf, filename=buf.name)
 
-
 # ==================== CALLBACK ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -396,11 +551,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚀 Scan started! Live results below 👇")
         asyncio.create_task(run_scan(context, uid, query.message.chat_id))
 
-
 # ==================== MAIN ====================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("pages", set_pages))
@@ -410,9 +563,8 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    print("🚀 Yahoo Dork Parser Bot running...")
+    print("🚀 Yahoo Dork Parser Bot with Captcha Bypass running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
