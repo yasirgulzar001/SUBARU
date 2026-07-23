@@ -32,8 +32,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"   # <-- replace
-AUTHORIZED_USER = 0
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"   # <-- replace with your bot token
+AUTHORIZED_USER = 0            # 0 = anyone can use in private chat
 
 BLACKLIST = [
     "google.", "facebook.", "youtube.", "twitter.", "instagram.",
@@ -191,20 +191,19 @@ class ProxyChecker:
             verify=False
         )
         try:
-            # 1. Connectivity + anonymity
+            # 1. Connectivity + anonymity (ipify)
             start = time.monotonic()
             resp = await session.get("https://api.ipify.org?format=json", headers=headers)
             if resp.status_code != 200:
                 return (False, 0, f"ipify status {resp.status_code}")
             try:
                 data = resp.json()
-                proxy_ip = data.get("ip", "")
-                if not proxy_ip:
-                    return (False, 0, "No IP in response")
+                if not data.get("ip"):
+                    return (False, 0, "No IP returned")
             except Exception:
                 return (False, 0, "Invalid JSON from ipify")
 
-            # 2. Yahoo compatibility
+            # 2. Yahoo compatibility (search test)
             yahoo_resp = await session.get("https://search.yahoo.com/search?p=test&pz=1", headers=headers, timeout=15)
             if yahoo_resp.status_code != 200:
                 return (False, 0, f"Yahoo status {yahoo_resp.status_code}")
@@ -347,7 +346,7 @@ class YahooFixedProxyScraper:
 
     async def _get_worker(self) -> ProxyWorker:
         async with self._lock:
-            # Try to find healthy worker
+            # Try to find a healthy worker
             for _ in range(len(self.workers)):
                 idx = self._next_worker_idx
                 self._next_worker_idx = (idx + 1) % len(self.workers)
@@ -401,11 +400,11 @@ class YahooFixedProxyScraper:
                 logger.info(f"Captcha on {dork} page {page} via {worker.cfg.proxy_url[:20]}... solving")
                 solved = await captcha_solver.solve_async(worker.session, html, url)
                 if solved:
-                    # retry immediately with same worker (session now has cookies)
+                    # Retry immediately with the same worker (session now has valid cookies)
                     html = await worker.fetch(url)
                     if html and not captcha_solver.is_captcha_page(html):
                         return self._parse_results(html)
-                # if not solved, try another worker
+                # If not solved, try another worker
                 await asyncio.sleep(2)
                 continue
 
@@ -455,8 +454,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "/setproxies – Upload proxy list\n"
         "/checkproxies – Validate current proxies\n"
-        "/pages `<n>` – pages per dork\n"
-        "/speed `<n>` – req/s per proxy\n"
+        "/pages `<n>` – pages per dork (1‑50)\n"
+        "/speed `<n>` – req/s per proxy (0.5‑2.0)\n"
         "/status – live progress\n"
         "/stop – stop & save\n"
         "/reset – clear session\n\n"
@@ -518,11 +517,16 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions[update.effective_user.id] = UserSession()
     await update.message.reply_text("♻️ Session reset.")
 
-# Proxy upload using ConversationHandler
+# ==================== PROXY UPLOAD (FLEXIBLE FORMAT) ====================
 async def set_proxies_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id): return
     await update.message.reply_text(
-        "📎 Please upload a `.txt` file with proxies (format: `ip:port:user:pass`, one per line)."
+        "📎 Upload a `.txt` file with proxies.\n"
+        "Formats accepted:\n"
+        "`ip:port`\n"
+        "`ip:port:user:pass`\n"
+        "`http://user:pass@ip:port`\n"
+        "`http://ip:port`"
     )
     return WAITING_FOR_PROXY_FILE
 
@@ -530,6 +534,7 @@ async def receive_proxy_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     if not authorized(uid): return ConversationHandler.END
     s = get_session(uid)
+
     doc = update.message.document
     if not doc or not doc.file_name.endswith(".txt"):
         await update.message.reply_text("❌ Must be a `.txt` file. Try again with /setproxies.")
@@ -539,25 +544,58 @@ async def receive_proxy_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = await file.download_as_bytearray()
     lines = data.decode("utf-8", errors="ignore").strip().splitlines()
     configs = []
+
     for line in lines:
         line = line.strip()
-        if not line: continue
-        parts = line.split(":")
-        if len(parts) == 4:
-            ip, port, user, pwd = parts
-            proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
+        if not line:
+            continue
+
+        # Remove protocol if present
+        line = re.sub(r'^https?://', '', line)
+
+        # Pattern 1: user:pass@host:port
+        m = re.match(r'^([^:]+):([^@]+)@([^:]+):(\d+)$', line)
+        if m:
+            user, pwd, host, port = m.groups()
+            proxy_url = f"http://{user}:{pwd}@{host}:{port}"
             fingerprint = random.choice(TLS_PROFILES)
             configs.append(ProxyConfig(proxy_url, fingerprint=fingerprint))
-        else:
-            logger.warning(f"Invalid proxy line: {line}")
+            continue
+
+        # Pattern 2: host:port:user:pass (no @)
+        parts = line.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy_url = f"http://{user}:{pwd}@{host}:{port}"
+            fingerprint = random.choice(TLS_PROFILES)
+            configs.append(ProxyConfig(proxy_url, fingerprint=fingerprint))
+            continue
+
+        # Pattern 3: host:port (no auth)
+        if len(parts) == 2 and parts[1].isdigit():
+            host, port = parts
+            proxy_url = f"http://{host}:{port}"
+            fingerprint = random.choice(TLS_PROFILES)
+            configs.append(ProxyConfig(proxy_url, fingerprint=fingerprint))
+            continue
+
+        logger.warning(f"Invalid proxy line: {line}")
 
     if not configs:
-        await update.message.reply_text("❌ No valid proxies found. Format: `ip:port:user:pass`")
+        await update.message.reply_text(
+            "❌ No valid proxies found. Supported formats:\n"
+            "`ip:port`\n`ip:port:user:pass`\n`http://user:pass@ip:port`"
+        )
         return ConversationHandler.END
 
     s.proxy_configs = configs
+    # Automatically check proxies immediately
+    await update.message.reply_text(f"✅ Loaded *{len(configs)}* proxies. Running automatic check...", parse_mode="Markdown")
+    checker = ProxyChecker(s.proxy_configs)
+    valid = await checker.check_all()
     await update.message.reply_text(
-        f"✅ Loaded *{len(configs)}* proxies.\nUse `/checkproxies` to validate them.",
+        f"🕵️ Automatic check complete: *{valid}/{len(configs)}* valid.\n"
+        f"You can also run `/checkproxies` again later.",
         parse_mode="Markdown"
     )
     return ConversationHandler.END
@@ -573,6 +611,7 @@ async def check_proxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     valid = await checker.check_all()
     await msg.edit_text(f"✅ Proxy check complete: *{valid}/{len(s.proxy_configs)}* valid.", parse_mode="Markdown")
 
+# ==================== DORK FILE UPLOAD ====================
 async def handle_dork_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not authorized(uid): return
@@ -600,10 +639,10 @@ async def handle_dork_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s.current_dork = 0
     s.stop_flag = False
 
+    valid_count = sum(1 for c in s.proxy_configs if c.valid)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🚀 Start Scan ({len(dorks)} dorks)", callback_data="start_scan")]
     ])
-    valid_count = sum(1 for c in s.proxy_configs if c.valid)
     await update.message.reply_text(
         f"✅ Loaded *{len(dorks)}* dorks.\n"
         f"⚡ Proxies: `{len(s.proxy_configs)}` loaded (`{valid_count}` valid)\n"
@@ -631,7 +670,8 @@ async def run_scan(context, uid: int, chat_id: int):
         )
         last_update = time.monotonic()
         for i, dork in enumerate(s.dorks, 1):
-            if s.stop_flag: break
+            if s.stop_flag:
+                break
             s.current_dork = i
             try:
                 urls = await scraper.process_dork(dork)
@@ -652,7 +692,8 @@ async def run_scan(context, uid: int, chat_id: int):
                              f"⚡ Proxies alive: `{sum(w.is_healthy for w in scraper.workers)}`/{len(scraper.workers)}",
                         parse_mode="Markdown"
                     )
-                except: pass
+                except:
+                    pass
     finally:
         await scraper.stop()
 
@@ -697,7 +738,7 @@ def main():
         states={
             WAITING_FOR_PROXY_FILE: [MessageHandler(filters.Document.ALL, receive_proxy_file)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)]
+        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)],
     )
 
     app.add_handler(CommandHandler("start", start))
