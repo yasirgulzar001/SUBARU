@@ -2,22 +2,27 @@ import asyncio
 import random
 import re
 import time
-import os
 import logging
-from dataclasses import dataclass, field
 from io import BytesIO
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Dict
 from urllib.parse import quote, unquote, urlparse
+from dataclasses import dataclass
 
-import tls_client
+# Async TLS fingerprinting
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests import AsyncSession
+
+# Parsing
 from bs4 import BeautifulSoup
+
+# Telegram bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# Image processing & OCR
+# Captcha OCR
 import pytesseract
 import cv2
 import numpy as np
@@ -49,43 +54,24 @@ BLACKLIST = [
     "paypal.com", "ebay.com", "netflix.", "spotify.", "twitch.",
 ]
 
-# ==================== SCRAPER CONFIGURATION ====================
+# ==================== SCRAPER CONFIG ====================
 @dataclass
 class ScraperConfig:
-    # Concurrency
     max_concurrent_requests: int = 10      # Max parallel Yahoo requests
-    requests_per_second: float = 1.5       # Target steady rate (token bucket fill rate)
+    requests_per_second: float = 1.5       # Target steady rate
     burst_size: int = 5                    # Max instant bursts
-
-    # Session pool
-    session_pool_size: int = 15            # Number of pre-warmed TLS sessions
+    session_pool_size: int = 15            # Pre‑warmed TLS sessions
     session_reuse_count: int = 50          # Max requests per session before recycling
-
-    # Retry & backoff
     max_retries: int = 3
-    base_backoff: float = 2.0             # seconds
-
-    # Parsing
+    base_backoff: float = 2.0
     max_pages_per_dork: int = 10
-    results_per_page: int = 10            # Yahoo shows 10 results per page
-
-    # Captcha
     captcha_max_retries: int = 2
 
-    # Adaptive throttling
-    error_threshold: float = 0.3          # If error ratio > this, reduce concurrency
-
-# ==================== TLS IDENTITIES & USER AGENTS ====================
+# ==================== TLS IDENTITIES ====================
 TLS_PROFILES = [
-    "chrome_103", "chrome_104", "chrome_105", "chrome_106",
-    "chrome_107", "chrome_108", "chrome_109", "chrome_110",
-    "chrome_111", "chrome_112", "chrome_116", "chrome_117",
-    "chrome_118", "chrome_119", "chrome_120",
-    "firefox_102", "firefox_104", "firefox_105", "firefox_106",
-    "firefox_108", "firefox_110", "firefox_117", "firefox_120",
-    "opera_89", "opera_90", "opera_91",
-    "safari_15_3", "safari_15_6_1", "safari_16_0",
-    "safari_ios_15_5", "safari_ios_15_6", "safari_ios_16_0",
+    "chrome120", "chrome119", "chrome116", "chrome110", "chrome107",
+    "chrome104", "safari16_0", "safari15_5", "firefox120", "firefox110",
+    "opera91", "opera90", "edge101"
 ]
 
 USER_AGENTS = [
@@ -100,7 +86,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
 ]
 
-def random_headers() -> dict:
+def random_headers() -> Dict[str, str]:
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -110,54 +96,51 @@ def random_headers() -> dict:
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": random.choice(["none", "same-origin"]),
+        "Sec-Fetch-Site": "none",
         "Cache-Control": "max-age=0",
     }
 
-# ==================== SESSION POOL & RATE LIMITER ====================
-class SessionPool:
-    """Maintains a pool of reusable TLS sessions with unique fingerprints."""
-    def __init__(self, size: int = 15, max_requests_per_session: int = 50):
-        self._pool: List[tls_client.Session] = []
-        self._usage_count: List[int] = []
+# ==================== ASYNC SESSION POOL ====================
+class AsyncSessionPool:
+    def __init__(self, pool_size: int = 15, max_requests_per_session: int = 50):
+        self._pool: List[AsyncSession] = []
+        self._usage: List[int] = []
         self._lock = asyncio.Lock()
         self.max_requests = max_requests_per_session
-        # Pre-warm pool
-        for _ in range(size):
-            self._add_session()
+        self.pool_size = pool_size
 
-    def _add_session(self):
+    async def init(self):
+        async with self._lock:
+            for _ in range(self.pool_size):
+                sess = await self._create_session()
+                self._pool.append(sess)
+                self._usage.append(0)
+
+    async def _create_session(self) -> AsyncSession:
         profile = random.choice(TLS_PROFILES)
-        session = tls_client.Session(
-            client_identifier=profile,
-            random_tls_extension_order=True,
-        )
-        self._pool.append(session)
-        self._usage_count.append(0)
+        return AsyncSession(impersonate=profile)
 
-    async def get_session(self) -> tls_client.Session:
+    async def get(self) -> AsyncSession:
         async with self._lock:
             # Recycle exhausted sessions
-            for i, count in enumerate(self._usage_count):
+            for i, count in enumerate(self._usage):
                 if count >= self.max_requests:
-                    self._pool[i] = self._create_fresh_session()
-                    self._usage_count[i] = 0
-            # Pick random (avoids sequential fingerprint linking)
+                    await self._pool[i].close()
+                    self._pool[i] = await self._create_session()
+                    self._usage[i] = 0
             idx = random.randrange(len(self._pool))
-            self._usage_count[idx] += 1
+            self._usage[idx] += 1
             return self._pool[idx]
 
-    def _create_fresh_session(self) -> tls_client.Session:
-        profile = random.choice(TLS_PROFILES)
-        return tls_client.Session(
-            client_identifier=profile,
-            random_tls_extension_order=True,
-        )
+    async def close_all(self):
+        async with self._lock:
+            for sess in self._pool:
+                await sess.close()
 
-class TokenBucket:
-    """Asynchronous token bucket rate limiter."""
+# ==================== TOKEN BUCKET ====================
+class AsyncTokenBucket:
     def __init__(self, rate: float, burst: int):
-        self.rate = rate          # tokens per second
+        self.rate = rate
         self.burst = burst
         self.tokens = burst
         self.last_refill = time.monotonic()
@@ -176,39 +159,31 @@ class TokenBucket:
             else:
                 self.tokens -= 1
 
-# ==================== CAPTCHA SOLVER (Enhanced) ====================
+# ==================== CAPTCHA SOLVER ====================
 class CaptchaSolver:
-    """Self‑contained Yahoo captcha solver using Tesseract OCR with advanced preprocessing."""
     CAPTCHA_KEYWORDS = ["captcha", "security check", "are you a robot", "sorry"]
 
     def __init__(self):
-        # Tesseract path (adjust if needed)
         self.tesseract_cmd = pytesseract.pytesseract.tesseract_cmd or 'tesseract'
 
     def is_captcha_page(self, html: str) -> bool:
         return any(word in html.lower() for word in self.CAPTCHA_KEYWORDS)
 
     def _preprocess_image(self, image_bytes: bytes) -> bytes:
-        """Heavy preprocessing for noisy captchas."""
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
             return image_bytes
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Remove noise with bilateral filter
         denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-        # Increase contrast
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(denoised)
-        # Adaptive threshold
         thresh = cv2.adaptiveThreshold(
             enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 15, 3
         )
-        # Remove small blobs
         kernel = np.ones((2, 2), np.uint8)
         cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        # Invert for Tesseract (black text on white)
         pil_img = Image.fromarray(255 - cleaned)
         buf = BytesIO()
         pil_img.save(buf, format="PNG")
@@ -217,13 +192,12 @@ class CaptchaSolver:
     def _ocr_image(self, image_bytes: bytes) -> str:
         processed = self._preprocess_image(image_bytes)
         img = Image.open(BytesIO(processed))
-        # Config for single word alphanumeric
         config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
         return pytesseract.image_to_string(img, config=config).strip()
 
     def _find_image_and_form(self, html: str, base_url: str) -> tuple[Optional[str], Optional[str]]:
         soup = BeautifulSoup(html, "lxml")
-        # Find image
+        # Find captcha image
         img_url = None
         for img in soup.find_all("img", src=True):
             if "captcha" in img["src"].lower() or "challenge" in img["src"].lower():
@@ -252,63 +226,102 @@ class CaptchaSolver:
                 break
         return img_url, form_action
 
-    def solve(self, session: tls_client.Session, captcha_html: str, original_url: str) -> bool:
+    def solve_sync(self, session, captcha_html: str, original_url: str) -> bool:
+        """Synchronous solve to run in thread (because OCR is CPU‑bound)."""
         img_url, form_action = self._find_image_and_form(captcha_html, original_url)
         if not img_url or not form_action:
             return False
 
-        for attempt in range(2):  # two tries with slight image adjustments
+        for _ in range(2):
             try:
-                resp = session.get(img_url, headers=random_headers(), timeout_seconds=10)
-                if resp.status_code != 200:
+                # Use the session (it may be a curl_cffi async session; we need to call sync methods)
+                # Since we're inside a thread, we can use session's sync get/post?
+                # AsyncSession has get/post as async methods; we can't call them from thread directly.
+                # We'll use a synchronous curl_cffi Session just for the captcha image download & POST.
+                from curl_cffi import requests as sync_requests
+                img_resp = sync_requests.get(img_url, headers=random_headers(), timeout=10)
+                if img_resp.status_code != 200:
                     continue
-                answer = self._ocr_image(resp.content)
+                answer = self._ocr_image(img_resp.content)
                 if len(answer) < 3:
                     continue
-
                 payload = {"captchaAnswer": answer, "answer": answer, "submit": "Continue"}
-                post_resp = session.post(
-                    form_action, data=payload, headers=random_headers(),
-                    timeout_seconds=15, allow_redirects=True
-                )
+                post_resp = sync_requests.post(form_action, data=payload, headers=random_headers(), timeout=15, allow_redirects=True)
+                if not self.is_captcha_page(post_resp.text):
+                    # Transfer cookies from sync session to async session? Not needed if we use same session object? 
+                    # Better: we'll perform the whole captcha solve using the original AsyncSession's cookie jar,
+                    # but we can't call async methods from thread. So we'll implement an async solve method.
+                    # I'll refactor to have an async solve that runs OCR in executor.
+                    # For simplicity now, I'll use a separate sync session and just return True if solved.
+                    # This won't transfer cookies back. We need a better integration. Let's do it properly.
+                    pass
+            except Exception as e:
+                logger.warning(f"Captcha solve error: {e}")
+        return False
+
+    # Better: async solve that uses executor for OCR but async HTTP
+    async def solve(self, session: AsyncSession, captcha_html: str, original_url: str) -> bool:
+        img_url, form_action = self._find_image_and_form(captcha_html, original_url)
+        if not img_url or not form_action:
+            return False
+
+        for _ in range(2):
+            try:
+                # Download captcha image using the same async session (so cookies match)
+                resp = await session.get(img_url, headers=random_headers(), timeout=10)
+                if resp.status_code != 200:
+                    continue
+                # OCR in thread (CPU‑bound)
+                loop = asyncio.get_running_loop()
+                answer = await loop.run_in_executor(None, self._ocr_image, resp.content)
+                if len(answer) < 3:
+                    continue
+                payload = {"captchaAnswer": answer, "answer": answer, "submit": "Continue"}
+                # Submit using same session to keep cookies
+                post_resp = await session.post(form_action, data=payload, headers=random_headers(), timeout=15, allow_redirects=True)
                 if not self.is_captcha_page(post_resp.text):
                     return True
             except Exception as e:
-                logger.warning(f"Captcha solve attempt {attempt+1} failed: {e}")
+                logger.warning(f"Captcha solve attempt failed: {e}")
         return False
 
 captcha_solver = CaptchaSolver()
 
-# ==================== YAHOO SCRAPER ENGINE ====================
-class YahooScraper:
-    def __init__(self, config: Optional[ScraperConfig] = None):
-        self.config = config or ScraperConfig()
-        self.session_pool = SessionPool(
-            size=self.config.session_pool_size,
-            max_requests_per_session=self.config.session_reuse_count
+# ==================== YAHOO SCRAPER (PURE ASYNC) ====================
+class YahooAsyncScraper:
+    def __init__(self, config: ScraperConfig):
+        self.config = config
+        self.session_pool: Optional[AsyncSessionPool] = None
+        self.rate_limiter = AsyncTokenBucket(
+            rate=config.requests_per_second,
+            burst=config.burst_size
         )
-        self.rate_limiter = TokenBucket(
-            rate=self.config.requests_per_second,
-            burst=self.config.burst_size
-        )
-        self.semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
+        self.sem = asyncio.Semaphore(config.max_concurrent_requests)
         self._error_count = 0
         self._total_requests = 0
         self._lock = asyncio.Lock()
 
+    async def start(self):
+        self.session_pool = AsyncSessionPool(
+            pool_size=self.config.session_pool_size,
+            max_requests_per_session=self.config.session_reuse_count
+        )
+        await self.session_pool.init()
+
+    async def stop(self):
+        await self.session_pool.close_all()
+
     async def _adaptive_delay(self, success: bool):
-        """Slow down if error ratio exceeds threshold."""
         async with self._lock:
             self._total_requests += 1
             if not success:
                 self._error_count += 1
             error_ratio = self._error_count / max(1, self._total_requests)
-            if error_ratio > self.config.error_threshold:
-                # Temporarily reduce concurrency by sleeping extra
+            if error_ratio > 0.3:
                 await asyncio.sleep(random.uniform(1.0, 3.0))
 
     @staticmethod
-    def _clean_yahoo_url(href: str) -> Optional[str]:
+    def clean_yahoo_url(href: str) -> Optional[str]:
         try:
             if "/RU=" in href:
                 m = re.search(r"/RU=([^/]+)/RK=", href)
@@ -321,59 +334,51 @@ class YahooScraper:
         return None
 
     @staticmethod
-    def _is_blacklisted(url: str) -> bool:
+    def is_blacklisted(url: str) -> bool:
         low = url.lower()
         return any(b in low for b in BLACKLIST)
 
     async def _fetch_page(self, dork: str, page: int) -> List[str]:
-        """Fetch a single search results page, returning list of cleaned URLs."""
         offset = (page * 10) + 1
         query = quote(dork)
         url = f"https://search.yahoo.com/search?p={query}&b={offset}&pz=10"
 
         for retry in range(self.config.max_retries):
-            # Rate limit before request
             await self.rate_limiter.acquire()
-            async with self.semaphore:
-                session = await self.session_pool.get_session()
+            async with self.sem:
+                session = await self.session_pool.get()
                 headers = random_headers()
                 try:
-                    loop = asyncio.get_running_loop()
-                    # Run blocking network call in thread (tls_client is synchronous)
-                    resp = await loop.run_in_executor(
-                        None, lambda: session.get(url, headers=headers, timeout_seconds=25)
-                    )
+                    resp = await session.get(url, headers=headers, timeout=25)
                     if resp.status_code == 429:
                         await self._adaptive_delay(False)
                         backoff = self.config.base_backoff * (2 ** retry) + random.uniform(0, 1)
                         await asyncio.sleep(backoff)
                         continue
-
                     if resp.status_code != 200:
                         await self._adaptive_delay(False)
                         return []
 
                     html = resp.text
-                    # Captcha handling
+                    # Captcha?
                     if captcha_solver.is_captcha_page(html):
                         logger.info(f"Captcha on {dork} page {page}, solving...")
-                        solved = await loop.run_in_executor(
-                            None, captcha_solver.solve, session, html, url
-                        )
+                        solved = await captcha_solver.solve(session, html, url)
                         if solved:
                             logger.info("Captcha solved, retrying request")
-                            continue  # retry with same session (now has valid cookies)
+                            continue  # retry original request with same session (now has cookies)
                         else:
                             await self._adaptive_delay(False)
                             return []
 
-                    # Parse
+                    # Parse results (CPU but light; using lxml)
+                    loop = asyncio.get_running_loop()
                     urls = await loop.run_in_executor(None, self._parse_results, html)
                     await self._adaptive_delay(True)
                     return urls
 
                 except Exception as e:
-                    logger.error(f"Request failed (retry {retry}): {e}")
+                    logger.warning(f"Error {dork} page {page}: {e}")
                     await self._adaptive_delay(False)
                     backoff = self.config.base_backoff * (2 ** retry) + random.uniform(0, 1)
                     await asyncio.sleep(backoff)
@@ -383,27 +388,20 @@ class YahooScraper:
         urls = set()
         soup = BeautifulSoup(html, "lxml")
         for a in soup.find_all("a", href=True):
-            real = self._clean_yahoo_url(a["href"])
-            if not real or not real.startswith("http"):
-                continue
-            if self._is_blacklisted(real):
-                continue
-            urls.add(real.rstrip("/"))
+            real = self.clean_yahoo_url(a["href"])
+            if real and real.startswith("http") and not self.is_blacklisted(real):
+                urls.add(real.rstrip("/"))
         return list(urls)
 
     async def process_dork(self, dork: str) -> Set[str]:
-        """Scrape all configured pages for a single dork."""
-        tasks = [
-            self._fetch_page(dork, page)
-            for page in range(self.config.max_pages_per_dork)
-        ]
+        tasks = [self._fetch_page(dork, p) for p in range(self.config.max_pages_per_dork)]
         results = await asyncio.gather(*tasks)
         found = set()
         for lst in results:
             found.update(lst)
         return found
 
-# ==================== TELEGRAM BOT SESSION & HANDLERS ====================
+# ==================== TELEGRAM USER SESSION ====================
 class UserSession:
     def __init__(self):
         self.running = False
@@ -425,21 +423,21 @@ def get_session(uid: int) -> UserSession:
 def authorized(uid: int) -> bool:
     return AUTHORIZED_USER == 0 or uid == AUTHORIZED_USER
 
-# Command handlers (similar to before but using UserSession.config)
+# ==================== BOT COMMANDS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id): return
     text = (
-        "🔎 *Yahoo Mass Dork Parser — High‑Speed Proxyless*\n\n"
-        "⚡ Session pool · Adaptive rate limit · Captcha bypass\n"
-        "🚀 Handles 20k+ dorks efficiently\n\n"
+        "🔎 *Yahoo Dork Parser — Pure Async Engine*\n\n"
+        "⚡ Proxyless · Session Pool · Rate Limit · Captcha Bypass\n"
+        "🚀 Handles thousands of dorks at high speed\n\n"
         "*Commands:*\n"
-        "/pages `<n>` – pages per dork (1-50)\n"
+        "/pages `<n>` – pages per dork (1‑50)\n"
         "/speed `<n>` – max requests/sec (0.5‑3.0)\n"
         "/status – live progress\n"
-        "/stop – stop & save\n"
+        "/stop – stop & save results\n"
         "/reset – clear session\n"
         "/help – this message\n\n"
-        "📤 Upload a `.txt` file (1 dork/line) to start."
+        "📤 Upload a `.txt` file (1 dork per line) to start."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -465,11 +463,10 @@ async def set_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not 0.5 <= rate <= 3.0:
             raise ValueError
         s.config.requests_per_second = rate
-        # Also adjust burst and concurrency proportionally
         s.config.burst_size = max(2, int(rate * 3))
         s.config.max_concurrent_requests = max(2, int(rate * 5))
         await update.message.reply_text(
-            f"✅ Speed set to *{rate}* req/s (concurrency: {s.config.max_concurrent_requests}).",
+            f"✅ Speed set to *{rate}* req/s (concurrency {s.config.max_concurrent_requests}).",
             parse_mode="Markdown"
         )
     except:
@@ -497,7 +494,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("💤 Nothing to stop.")
         return
     s.stop_flag = True
-    await update.message.reply_text("🛑 Stopping... Results will be sent shortly.")
+    await update.message.reply_text("🛑 Stopping... Results will be sent.")
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id): return
@@ -521,7 +518,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await file.download_as_bytearray()
     raw = data.decode("utf-8", errors="ignore")
     dorks = list(dict.fromkeys(line.strip() for line in raw.splitlines() if line.strip()))
-
     if not dorks:
         await update.message.reply_text("❌ File is empty.")
         return
@@ -533,7 +529,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s.stop_flag = False
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🚀 Start ({len(dorks)} dorks)", callback_data="start_scan")]
+        [InlineKeyboardButton(f"🚀 Start Scan ({len(dorks)} dorks)", callback_data="start_scan")]
     ])
     await update.message.reply_text(
         f"✅ Loaded *{len(dorks)}* dorks.\n"
@@ -549,44 +545,45 @@ async def run_scan(context, uid: int, chat_id: int):
     s.running = True
     s.stop_flag = False
 
-    scraper = YahooScraper(s.config)
-    s.status_msg = await context.bot.send_message(
-        chat_id,
-        "🔎 *Scanning with adaptive engine...*\n\nCaptcha bypass active.",
-        parse_mode="Markdown"
-    )
-
-    last_update = time.monotonic()
-    for i, dork in enumerate(s.dorks, 1):
-        if s.stop_flag:
-            break
-        s.current_dork = i
-        try:
-            urls = await scraper.process_dork(dork)
-            s.found_urls.update(urls)
-        except Exception as e:
-            logger.error(f"Dork error: {e}")
-
-        # Live update every 2 seconds
-        now = time.monotonic()
-        if now - last_update > 2:
-            last_update = now
+    scraper = YahooAsyncScraper(s.config)
+    await scraper.start()
+    try:
+        s.status_msg = await context.bot.send_message(
+            chat_id,
+            "🔎 *Scanning with async engine...*\n\nCaptcha bypass active.",
+            parse_mode="Markdown"
+        )
+        last_update = time.monotonic()
+        for i, dork in enumerate(s.dorks, 1):
+            if s.stop_flag:
+                break
+            s.current_dork = i
             try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=s.status_msg.message_id,
-                    text=(
-                        f"🔎 *Live Results*\n\n"
-                        f"🔗 URLs: `{len(s.found_urls)}`\n"
-                        f"📝 Dork: `{s.current_dork}/{s.total_dorks}`\n"
-                        f"⚡ Speed: `{s.config.requests_per_second}` req/s"
-                    ),
-                    parse_mode="Markdown"
-                )
-            except:
-                pass
+                urls = await scraper.process_dork(dork)
+                s.found_urls.update(urls)
+            except Exception as e:
+                logger.error(f"Dork error: {e}")
 
-    # Finalize
+            now = time.monotonic()
+            if now - last_update > 2:
+                last_update = now
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=s.status_msg.message_id,
+                        text=(
+                            f"🔎 *Live Results*\n\n"
+                            f"🔗 URLs: `{len(s.found_urls)}`\n"
+                            f"📝 Dork: `{s.current_dork}/{s.total_dorks}`\n"
+                            f"⚡ Speed: `{s.config.requests_per_second}` req/s"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+    finally:
+        await scraper.stop()
+
     s.running = False
     urls = sorted(s.found_urls)
     if not urls:
@@ -635,7 +632,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    logger.info("🚀 Yahoo Dork Parser bot running (proxyless, high‑speed)")
+    logger.info("🚀 Yahoo Dork Parser (curl_cffi pure async) bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
