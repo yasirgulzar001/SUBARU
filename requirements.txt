@@ -1,5 +1,5 @@
 python-telegram-bot>=20.0
-tls-client>=0.2.0
+curl_cffi>=0.6.0
 beautifulsoup4>=4.12
 lxml>=4.9.0
 pytesseract>=0.3.10
