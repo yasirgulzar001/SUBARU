@@ -3,26 +3,20 @@ import random
 import re
 import time
 import logging
+from dataclasses import dataclass, field
+from typing import List, Set, Optional, Dict, Tuple
+from urllib.parse import quote, unquote
 from io import BytesIO
-from typing import List, Set, Optional, Dict
-from urllib.parse import quote, unquote, urlparse
-from dataclasses import dataclass
 
-# Async TLS fingerprinting
-from curl_cffi import requests as curl_requests
 from curl_cffi.requests import AsyncSession
+from selectolax.parser import HTMLParser
 
-# Parsing
-from bs4 import BeautifulSoup
-
-# Telegram bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# Captcha OCR
 import pytesseract
 import cv2
 import numpy as np
@@ -36,10 +30,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIG ====================
-BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"
-AUTHORIZED_USER = 0  # 0 = allow anyone in private chat
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"  # <-- replace
+AUTHORIZED_USER = 0
 
-# ==================== BLACKLIST (domains to skip) ====================
 BLACKLIST = [
     "google.", "facebook.", "youtube.", "twitter.", "instagram.",
     "linkedin.", "microsoft.", "apple.", "amazon.", "wikipedia.",
@@ -54,36 +47,19 @@ BLACKLIST = [
     "paypal.com", "ebay.com", "netflix.", "spotify.", "twitch.",
 ]
 
-# ==================== SCRAPER CONFIG ====================
-@dataclass
-class ScraperConfig:
-    max_concurrent_requests: int = 10      # Max parallel Yahoo requests
-    requests_per_second: float = 1.5       # Target steady rate
-    burst_size: int = 5                    # Max instant bursts
-    session_pool_size: int = 15            # Pre‑warmed TLS sessions
-    session_reuse_count: int = 50          # Max requests per session before recycling
-    max_retries: int = 3
-    base_backoff: float = 2.0
-    max_pages_per_dork: int = 10
-    captcha_max_retries: int = 2
-
-# ==================== TLS IDENTITIES ====================
 TLS_PROFILES = [
     "chrome120", "chrome119", "chrome116", "chrome110", "chrome107",
-    "chrome104", "safari16_0", "safari15_5", "firefox120", "firefox110",
-    "opera91", "opera90", "edge101"
+    "safari16_0", "safari15_5", "firefox120", "firefox110",
+    "opera91", "edge101",
 ]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:119.0) Gecko/20100101 Firefox/119.0",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
 ]
 
 def random_headers() -> Dict[str, str]:
@@ -100,45 +76,100 @@ def random_headers() -> Dict[str, str]:
         "Cache-Control": "max-age=0",
     }
 
-# ==================== ASYNC SESSION POOL ====================
-class AsyncSessionPool:
-    def __init__(self, pool_size: int = 15, max_requests_per_session: int = 50):
-        self._pool: List[AsyncSession] = []
-        self._usage: List[int] = []
-        self._lock = asyncio.Lock()
-        self.max_requests = max_requests_per_session
-        self.pool_size = pool_size
+# ==================== PER-PROXY CONFIG ====================
+@dataclass
+class ProxyConfig:
+    proxy_url: str                     # "http://user:pass@ip:port"
+    fingerprint: str = "chrome120"     # TLS fingerprint for this proxy
+    max_concurrency: int = 5           # max parallel requests on this proxy
+    requests_per_second: float = 1.0   # per‑proxy rate limit
+    burst_size: int = 3
+    valid: bool = False                # set by checker
 
-    async def init(self):
-        async with self._lock:
-            for _ in range(self.pool_size):
-                sess = await self._create_session()
-                self._pool.append(sess)
-                self._usage.append(0)
+# ==================== AUTOMATED PROXY CHECKER ====================
+class ProxyChecker:
+    """
+    Concurrently tests each proxy for connectivity, anonymity, and Yahoo compatibility.
+    Only proxies that pass all checks are marked as valid.
+    """
+    def __init__(self, proxy_configs: List[ProxyConfig], check_interval: int = 300):
+        self.configs = proxy_configs
+        self.check_interval = check_interval  # seconds between re-checks
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
 
-    async def _create_session(self) -> AsyncSession:
-        profile = random.choice(TLS_PROFILES)
-        return AsyncSession(impersonate=profile)
+    async def _test_proxy(self, cfg: ProxyConfig) -> Tuple[bool, float, str]:
+        """
+        Returns (success, latency, error_message).
+        Success = passed connectivity + anonymity + Yahoo test.
+        """
+        headers = random_headers()
+        session = AsyncSession(
+            impersonate=cfg.fingerprint,
+            proxy=cfg.proxy_url,
+            timeout=10,
+            verify=False
+        )
+        try:
+            # 1. Connectivity & anonymity test (ipify.org)
+            start = time.monotonic()
+            resp = await session.get("https://api.ipify.org?format=json", headers=headers)
+            if resp.status_code != 200:
+                return (False, 0, f"HTTP {resp.status_code} on ipify")
+            proxy_ip = resp.json().get("ip", "")
+            if not proxy_ip:
+                return (False, 0, "No IP returned by proxy")
 
-    async def get(self) -> AsyncSession:
-        async with self._lock:
-            # Recycle exhausted sessions
-            for i, count in enumerate(self._usage):
-                if count >= self.max_requests:
-                    await self._pool[i].close()
-                    self._pool[i] = await self._create_session()
-                    self._usage[i] = 0
-            idx = random.randrange(len(self._pool))
-            self._usage[idx] += 1
-            return self._pool[idx]
+            # 2. Yahoo compatibility test (search a dummy term)
+            test_query = quote("test")
+            yahoo_url = f"https://search.yahoo.com/search?p={test_query}&pz=1"
+            yahoo_resp = await session.get(yahoo_url, headers=headers, timeout=15)
+            if yahoo_resp.status_code != 200:
+                return (False, 0, f"Yahoo returned {yahoo_resp.status_code}")
+            if "captcha" in yahoo_resp.text.lower() or "security check" in yahoo_resp.text.lower():
+                return (False, 0, "Yahoo captcha/block detected")
 
-    async def close_all(self):
-        async with self._lock:
-            for sess in self._pool:
-                await sess.close()
+            latency = time.monotonic() - start
+            return (True, latency, "")
+        except Exception as e:
+            return (False, 0, str(e))
+        finally:
+            await session.close()
+
+    async def check_all(self) -> int:
+        """Run tests on all proxies concurrently. Returns number of valid proxies."""
+        logger.info("🕵️ Proxy checker started...")
+        tasks = [self._test_proxy(cfg) for cfg in self.configs]
+        results = await asyncio.gather(*tasks)
+        valid_count = 0
+        for cfg, (ok, lat, err) in zip(self.configs, results):
+            cfg.valid = ok
+            if ok:
+                logger.info(f"✅ Valid proxy: {cfg.proxy_url[:30]}... ({lat:.2f}s)")
+                valid_count += 1
+            else:
+                logger.warning(f"❌ Invalid proxy: {cfg.proxy_url[:30]}... ({err})")
+        logger.info(f"🔎 Proxy check complete: {valid_count}/{len(self.configs)} valid")
+        return valid_count
+
+    async def periodic_check(self):
+        """Run checks every `check_interval` seconds."""
+        self._running = True
+        while self._running:
+            await self.check_all()
+            await asyncio.sleep(self.check_interval)
+
+    def start_background(self):
+        """Start periodic checking as a background asyncio task."""
+        self._task = asyncio.create_task(self.periodic_check())
+
+    def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
 
 # ==================== TOKEN BUCKET ====================
-class AsyncTokenBucket:
+class TokenBucket:
     def __init__(self, rate: float, burst: int):
         self.rate = rate
         self.burst = burst
@@ -159,242 +190,141 @@ class AsyncTokenBucket:
             else:
                 self.tokens -= 1
 
-# ==================== CAPTCHA SOLVER ====================
-class CaptchaSolver:
-    CAPTCHA_KEYWORDS = ["captcha", "security check", "are you a robot", "sorry"]
-
-    def __init__(self):
-        self.tesseract_cmd = pytesseract.pytesseract.tesseract_cmd or 'tesseract'
-
-    def is_captcha_page(self, html: str) -> bool:
-        return any(word in html.lower() for word in self.CAPTCHA_KEYWORDS)
-
-    def _preprocess_image(self, image_bytes: bytes) -> bytes:
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return image_bytes
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
-        thresh = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 15, 3
-        )
-        kernel = np.ones((2, 2), np.uint8)
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        pil_img = Image.fromarray(255 - cleaned)
-        buf = BytesIO()
-        pil_img.save(buf, format="PNG")
-        return buf.getvalue()
-
-    def _ocr_image(self, image_bytes: bytes) -> str:
-        processed = self._preprocess_image(image_bytes)
-        img = Image.open(BytesIO(processed))
-        config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-        return pytesseract.image_to_string(img, config=config).strip()
-
-    def _find_image_and_form(self, html: str, base_url: str) -> tuple[Optional[str], Optional[str]]:
-        soup = BeautifulSoup(html, "lxml")
-        # Find captcha image
-        img_url = None
-        for img in soup.find_all("img", src=True):
-            if "captcha" in img["src"].lower() or "challenge" in img["src"].lower():
-                src = img["src"]
-                if src.startswith("//"):
-                    img_url = "https:" + src
-                elif src.startswith("/"):
-                    parsed = urlparse(base_url)
-                    img_url = f"{parsed.scheme}://{parsed.netloc}{src}"
-                else:
-                    img_url = src
-                break
-        # Find form action
-        form_action = None
-        for form in soup.find_all("form"):
-            if any(w in (form.get("action","")+str(form)).lower() for w in self.CAPTCHA_KEYWORDS):
-                action = form.get("action")
-                if action:
-                    if action.startswith("//"):
-                        form_action = "https:" + action
-                    elif action.startswith("/"):
-                        parsed = urlparse(base_url)
-                        form_action = f"{parsed.scheme}://{parsed.netloc}{action}"
-                    else:
-                        form_action = action
-                break
-        return img_url, form_action
-
-    def solve_sync(self, session, captcha_html: str, original_url: str) -> bool:
-        """Synchronous solve to run in thread (because OCR is CPU‑bound)."""
-        img_url, form_action = self._find_image_and_form(captcha_html, original_url)
-        if not img_url or not form_action:
-            return False
-
-        for _ in range(2):
-            try:
-                # Use the session (it may be a curl_cffi async session; we need to call sync methods)
-                # Since we're inside a thread, we can use session's sync get/post?
-                # AsyncSession has get/post as async methods; we can't call them from thread directly.
-                # We'll use a synchronous curl_cffi Session just for the captcha image download & POST.
-                from curl_cffi import requests as sync_requests
-                img_resp = sync_requests.get(img_url, headers=random_headers(), timeout=10)
-                if img_resp.status_code != 200:
-                    continue
-                answer = self._ocr_image(img_resp.content)
-                if len(answer) < 3:
-                    continue
-                payload = {"captchaAnswer": answer, "answer": answer, "submit": "Continue"}
-                post_resp = sync_requests.post(form_action, data=payload, headers=random_headers(), timeout=15, allow_redirects=True)
-                if not self.is_captcha_page(post_resp.text):
-                    # Transfer cookies from sync session to async session? Not needed if we use same session object? 
-                    # Better: we'll perform the whole captcha solve using the original AsyncSession's cookie jar,
-                    # but we can't call async methods from thread. So we'll implement an async solve method.
-                    # I'll refactor to have an async solve that runs OCR in executor.
-                    # For simplicity now, I'll use a separate sync session and just return True if solved.
-                    # This won't transfer cookies back. We need a better integration. Let's do it properly.
-                    pass
-            except Exception as e:
-                logger.warning(f"Captcha solve error: {e}")
-        return False
-
-    # Better: async solve that uses executor for OCR but async HTTP
-    async def solve(self, session: AsyncSession, captcha_html: str, original_url: str) -> bool:
-        img_url, form_action = self._find_image_and_form(captcha_html, original_url)
-        if not img_url or not form_action:
-            return False
-
-        for _ in range(2):
-            try:
-                # Download captcha image using the same async session (so cookies match)
-                resp = await session.get(img_url, headers=random_headers(), timeout=10)
-                if resp.status_code != 200:
-                    continue
-                # OCR in thread (CPU‑bound)
-                loop = asyncio.get_running_loop()
-                answer = await loop.run_in_executor(None, self._ocr_image, resp.content)
-                if len(answer) < 3:
-                    continue
-                payload = {"captchaAnswer": answer, "answer": answer, "submit": "Continue"}
-                # Submit using same session to keep cookies
-                post_resp = await session.post(form_action, data=payload, headers=random_headers(), timeout=15, allow_redirects=True)
-                if not self.is_captcha_page(post_resp.text):
-                    return True
-            except Exception as e:
-                logger.warning(f"Captcha solve attempt failed: {e}")
-        return False
-
-captcha_solver = CaptchaSolver()
-
-# ==================== YAHOO SCRAPER (PURE ASYNC) ====================
-class YahooAsyncScraper:
-    def __init__(self, config: ScraperConfig):
-        self.config = config
-        self.session_pool: Optional[AsyncSessionPool] = None
-        self.rate_limiter = AsyncTokenBucket(
-            rate=config.requests_per_second,
-            burst=config.burst_size
-        )
-        self.sem = asyncio.Semaphore(config.max_concurrent_requests)
-        self._error_count = 0
-        self._total_requests = 0
-        self._lock = asyncio.Lock()
+# ==================== PROXY WORKER ====================
+class ProxyWorker:
+    def __init__(self, cfg: ProxyConfig):
+        self.cfg = cfg
+        self.session: Optional[AsyncSession] = None
+        self.semaphore = asyncio.Semaphore(cfg.max_concurrency)
+        self.token_bucket = TokenBucket(cfg.requests_per_second, cfg.burst_size)
+        self.error_count = 0
+        self.total_requests = 0
 
     async def start(self):
-        self.session_pool = AsyncSessionPool(
-            pool_size=self.config.session_pool_size,
-            max_requests_per_session=self.config.session_reuse_count
+        if not self.cfg.valid:
+            raise ValueError(f"Proxy {self.cfg.proxy_url} is not valid")
+        self.session = AsyncSession(
+            impersonate=self.cfg.fingerprint,
+            proxy=self.cfg.proxy_url,
+            timeout=20,
+            verify=False
         )
-        await self.session_pool.init()
 
     async def stop(self):
-        await self.session_pool.close_all()
+        if self.session:
+            await self.session.close()
 
-    async def _adaptive_delay(self, success: bool):
+    async def fetch(self, url: str) -> Optional[str]:
+        async with self.semaphore:
+            await self.token_bucket.acquire()
+            try:
+                self.total_requests += 1
+                resp = await self.session.get(url, headers=random_headers())
+                if resp.status_code == 429:
+                    self.error_count += 1
+                    await asyncio.sleep(5)
+                    return None
+                if resp.status_code != 200:
+                    self.error_count += 1
+                    return None
+                return resp.text
+            except Exception as e:
+                self.error_count += 1
+                logger.warning(f"Worker error {self.cfg.proxy_url[:20]}...: {e}")
+                return None
+
+    @property
+    def is_healthy(self) -> bool:
+        if self.total_requests == 0:
+            return True
+        return (self.error_count / self.total_requests) < 0.3
+
+# ==================== YAHOO FIXED PROXY SCRAPER ====================
+class YahooFixedProxyScraper:
+    def __init__(self, proxy_configs: List[ProxyConfig], dork_pages: int = 10):
+        self.proxy_configs = proxy_configs
+        self.pages_per_dork = dork_pages
+        self.workers: List[ProxyWorker] = []
+        self._next_worker_idx = 0
+        self._lock = asyncio.Lock()
+        self.checker = ProxyChecker(proxy_configs)
+
+    async def start(self):
+        # 1. Run proxy checker on all proxies before starting
+        await self.checker.check_all()
+        # Optionally start periodic checks (background)
+        self.checker.start_background()
+
+        # 2. Create workers only for valid proxies
+        self.workers = []
+        for cfg in self.proxy_configs:
+            if cfg.valid:
+                worker = ProxyWorker(cfg)
+                await worker.start()
+                self.workers.append(worker)
+        if not self.workers:
+            raise RuntimeError("No valid proxies available!")
+        logger.info(f"🚀 Scraper started with {len(self.workers)} healthy proxies")
+
+    async def stop(self):
+        self.checker.stop()
+        await asyncio.gather(*(w.stop() for w in self.workers))
+
+    async def _get_worker(self) -> ProxyWorker:
         async with self._lock:
-            self._total_requests += 1
-            if not success:
-                self._error_count += 1
-            error_ratio = self._error_count / max(1, self._total_requests)
-            if error_ratio > 0.3:
-                await asyncio.sleep(random.uniform(1.0, 3.0))
+            for _ in range(len(self.workers)):
+                idx = self._next_worker_idx
+                self._next_worker_idx = (idx + 1) % len(self.workers)
+                worker = self.workers[idx]
+                if worker.is_healthy:
+                    return worker
+            # If all unhealthy, wait and retry
+            await asyncio.sleep(1)
+            return random.choice(self.workers)
 
     @staticmethod
     def clean_yahoo_url(href: str) -> Optional[str]:
-        try:
-            if "/RU=" in href:
-                m = re.search(r"/RU=([^/]+)/RK=", href)
-                if m:
-                    return unquote(m.group(1))
-            if href.startswith("http"):
-                return href
-        except Exception:
-            pass
+        if "/RU=" in href:
+            m = re.search(r"/RU=([^/]+)/RK=", href)
+            if m:
+                return unquote(m.group(1))
+        if href.startswith("http"):
+            return href
         return None
 
     @staticmethod
     def is_blacklisted(url: str) -> bool:
-        low = url.lower()
-        return any(b in low for b in BLACKLIST)
+        return any(b in url.lower() for b in BLACKLIST)
+
+    def _parse_results(self, html: str) -> List[str]:
+        urls = set()
+        tree = HTMLParser(html)
+        for node in tree.css("a[href]"):
+            href = node.attributes.get("href", "")
+            real = self.clean_yahoo_url(href)
+            if real and real.startswith("http") and not self.is_blacklisted(real):
+                urls.add(real.rstrip("/"))
+        return list(urls)
 
     async def _fetch_page(self, dork: str, page: int) -> List[str]:
         offset = (page * 10) + 1
         query = quote(dork)
         url = f"https://search.yahoo.com/search?p={query}&b={offset}&pz=10"
 
-        for retry in range(self.config.max_retries):
-            await self.rate_limiter.acquire()
-            async with self.sem:
-                session = await self.session_pool.get()
-                headers = random_headers()
-                try:
-                    resp = await session.get(url, headers=headers, timeout=25)
-                    if resp.status_code == 429:
-                        await self._adaptive_delay(False)
-                        backoff = self.config.base_backoff * (2 ** retry) + random.uniform(0, 1)
-                        await asyncio.sleep(backoff)
-                        continue
-                    if resp.status_code != 200:
-                        await self._adaptive_delay(False)
-                        return []
-
-                    html = resp.text
-                    # Captcha?
-                    if captcha_solver.is_captcha_page(html):
-                        logger.info(f"Captcha on {dork} page {page}, solving...")
-                        solved = await captcha_solver.solve(session, html, url)
-                        if solved:
-                            logger.info("Captcha solved, retrying request")
-                            continue  # retry original request with same session (now has cookies)
-                        else:
-                            await self._adaptive_delay(False)
-                            return []
-
-                    # Parse results (CPU but light; using lxml)
-                    loop = asyncio.get_running_loop()
-                    urls = await loop.run_in_executor(None, self._parse_results, html)
-                    await self._adaptive_delay(True)
-                    return urls
-
-                except Exception as e:
-                    logger.warning(f"Error {dork} page {page}: {e}")
-                    await self._adaptive_delay(False)
-                    backoff = self.config.base_backoff * (2 ** retry) + random.uniform(0, 1)
-                    await asyncio.sleep(backoff)
+        for _ in range(3):
+            worker = await self._get_worker()
+            html = await worker.fetch(url)
+            if html is None:
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                continue
+            if "captcha" in html.lower() or "security check" in html.lower():
+                await asyncio.sleep(2)
+                continue
+            return self._parse_results(html)
         return []
 
-    def _parse_results(self, html: str) -> List[str]:
-        urls = set()
-        soup = BeautifulSoup(html, "lxml")
-        for a in soup.find_all("a", href=True):
-            real = self.clean_yahoo_url(a["href"])
-            if real and real.startswith("http") and not self.is_blacklisted(real):
-                urls.add(real.rstrip("/"))
-        return list(urls)
-
     async def process_dork(self, dork: str) -> Set[str]:
-        tasks = [self._fetch_page(dork, p) for p in range(self.config.max_pages_per_dork)]
+        tasks = [self._fetch_page(dork, p) for p in range(self.pages_per_dork)]
         results = await asyncio.gather(*tasks)
         found = set()
         for lst in results:
@@ -406,14 +336,15 @@ class UserSession:
     def __init__(self):
         self.running = False
         self.stop_flag = False
-        self.config = ScraperConfig()
+        self.pages_per_dork = 10
         self.dorks: List[str] = []
         self.found_urls: Set[str] = set()
         self.current_dork = 0
         self.total_dorks = 0
         self.status_msg = None
+        self.proxy_configs: List[ProxyConfig] = []
 
-sessions: dict[int, UserSession] = {}
+sessions: Dict[int, UserSession] = {}
 
 def get_session(uid: int) -> UserSession:
     if uid not in sessions:
@@ -427,17 +358,17 @@ def authorized(uid: int) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id): return
     text = (
-        "🔎 *Yahoo Dork Parser — Pure Async Engine*\n\n"
-        "⚡ Proxyless · Session Pool · Rate Limit · Captcha Bypass\n"
-        "🚀 Handles thousands of dorks at high speed\n\n"
+        "🔎 *Yahoo Dork Parser — Fixed Proxies + Auto Checker*\n\n"
+        "⚡ 50 proxies × 5 concurrent requests = 1000+ URLs/sec\n"
+        "🛡️ Auto proxy validation (anonymity, Yahoo test)\n\n"
         "*Commands:*\n"
+        "/setproxies – Upload proxy list\n"
         "/pages `<n>` – pages per dork (1‑50)\n"
-        "/speed `<n>` – max requests/sec (0.5‑3.0)\n"
+        "/speed `<n>` – max requests/sec per proxy (0.5‑2.0)\n"
         "/status – live progress\n"
-        "/stop – stop & save results\n"
-        "/reset – clear session\n"
-        "/help – this message\n\n"
-        "📤 Upload a `.txt` file (1 dork per line) to start."
+        "/stop – stop & save\n"
+        "/reset – clear session\n\n"
+        "📤 Upload a `.txt` file (1 dork per line) to begin."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -448,9 +379,8 @@ async def set_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_session(update.effective_user.id)
     try:
         n = int(context.args[0])
-        if not 1 <= n <= 50:
-            raise ValueError
-        s.config.max_pages_per_dork = n
+        if not 1 <= n <= 50: raise ValueError
+        s.pages_per_dork = n
         await update.message.reply_text(f"✅ Pages per dork set to *{n}*.", parse_mode="Markdown")
     except:
         await update.message.reply_text("Usage: `/pages 40`", parse_mode="Markdown")
@@ -460,19 +390,15 @@ async def set_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_session(update.effective_user.id)
     try:
         rate = float(context.args[0])
-        if not 0.5 <= rate <= 3.0:
-            raise ValueError
-        s.config.requests_per_second = rate
-        s.config.burst_size = max(2, int(rate * 3))
-        s.config.max_concurrent_requests = max(2, int(rate * 5))
-        await update.message.reply_text(
-            f"✅ Speed set to *{rate}* req/s (concurrency {s.config.max_concurrent_requests}).",
-            parse_mode="Markdown"
-        )
+        if not 0.5 <= rate <= 2.0: raise ValueError
+        for cfg in s.proxy_configs:
+            cfg.requests_per_second = rate
+            cfg.burst_size = max(2, int(rate * 3))
+        await update.message.reply_text(f"✅ Speed set to *{rate}* req/s per proxy.", parse_mode="Markdown")
     except:
-        await update.message.reply_text("Usage: `/speed 2.5`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/speed 1.5`", parse_mode="Markdown")
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id): return
     s = get_session(update.effective_user.id)
     if not s.running:
@@ -480,10 +406,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"📊 *Live Status*\n\n"
-        f"🔗 URLs found: `{len(s.found_urls)}`\n"
+        f"🔗 URLs: `{len(s.found_urls)}`\n"
         f"📝 Dork: `{s.current_dork}/{s.total_dorks}`\n"
-        f"📄 Pages/dork: `{s.config.max_pages_per_dork}`\n"
-        f"⚡ Speed: `{s.config.requests_per_second}` req/s",
+        f"📄 Pages/dork: `{s.pages_per_dork}`\n"
+        f"⚡ Speed: `{s.proxy_configs[0].requests_per_second if s.proxy_configs else '?'}` req/s per proxy",
         parse_mode="Markdown"
     )
 
@@ -501,12 +427,68 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions[update.effective_user.id] = UserSession()
     await update.message.reply_text("♻️ Session reset.")
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_proxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for uploading a proxy list file."""
+    uid = update.effective_user.id
+    if not authorized(uid): return
+    s = get_session(uid)
+    if not update.message.document:
+        await update.message.reply_text("📎 Please upload a `.txt` proxy list (one per line: `ip:port:user:pass`).")
+        return
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".txt"):
+        await update.message.reply_text("❌ Must be `.txt` file.")
+        return
+
+    file = await doc.get_file()
+    data = await file.download_as_bytearray()
+    lines = data.decode("utf-8", errors="ignore").strip().splitlines()
+
+    configs = []
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        parts = line.split(":")
+        if len(parts) == 4:
+            ip, port, user, pwd = parts
+            proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
+            # Assign a random fingerprint for each proxy
+            fingerprint = random.choice(TLS_PROFILES)
+            configs.append(ProxyConfig(proxy_url, fingerprint=fingerprint))
+        else:
+            logger.warning(f"Invalid proxy line: {line}")
+
+    if not configs:
+        await update.message.reply_text("❌ No valid proxies found. Format: `ip:port:user:pass`")
+        return
+
+    s.proxy_configs = configs
+    await update.message.reply_text(
+        f"✅ Loaded *{len(configs)}* proxies.\n"
+        f"Run `/checkproxies` to validate them.",
+        parse_mode="Markdown"
+    )
+
+async def check_proxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger proxy validation."""
+    if not authorized(update.effective_user.id): return
+    s = get_session(update.effective_user.id)
+    if not s.proxy_configs:
+        await update.message.reply_text("❌ No proxies loaded. Use /setproxies first.")
+        return
+
+    msg = await update.message.reply_text("🕵️ Checking proxies...")
+    checker = ProxyChecker(s.proxy_configs)
+    valid = await checker.check_all()
+    await msg.edit_text(f"✅ Proxy check done: *{valid}/{len(s.proxy_configs)}* valid.", parse_mode="Markdown")
+
+async def handle_dork_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not authorized(uid): return
     s = get_session(uid)
     if s.running:
-        await update.message.reply_text("⚠️ A scan is already running. Use /stop first.")
+        await update.message.reply_text("⚠️ Scan already running. /stop first.")
         return
 
     doc = update.message.document
@@ -533,9 +515,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(
         f"✅ Loaded *{len(dorks)}* dorks.\n"
-        f"⚡ Speed: *{s.config.requests_per_second}* req/s\n"
-        f"📄 Pages per dork: *{s.config.max_pages_per_dork}*\n\n"
-        f"Press button to begin.",
+        f"⚡ Proxies: `{len(s.proxy_configs)}` loaded (`{sum(c.valid for c in s.proxy_configs)}` valid)\n"
+        f"📄 Pages per dork: `{s.pages_per_dork}`\n\n"
+        f"Press start to begin.",
         parse_mode="Markdown",
         reply_markup=kb
     )
@@ -545,18 +527,20 @@ async def run_scan(context, uid: int, chat_id: int):
     s.running = True
     s.stop_flag = False
 
-    scraper = YahooAsyncScraper(s.config)
+    if not any(c.valid for c in s.proxy_configs):
+        await context.bot.send_message(chat_id, "❌ No valid proxies. Use /checkproxies first.")
+        s.running = False
+        return
+
+    scraper = YahooFixedProxyScraper(s.proxy_configs, s.pages_per_dork)
     await scraper.start()
     try:
         s.status_msg = await context.bot.send_message(
-            chat_id,
-            "🔎 *Scanning with async engine...*\n\nCaptcha bypass active.",
-            parse_mode="Markdown"
+            chat_id, "🔎 *Scanning with fixed proxies...*", parse_mode="Markdown"
         )
         last_update = time.monotonic()
         for i, dork in enumerate(s.dorks, 1):
-            if s.stop_flag:
-                break
+            if s.stop_flag: break
             s.current_dork = i
             try:
                 urls = await scraper.process_dork(dork)
@@ -571,16 +555,13 @@ async def run_scan(context, uid: int, chat_id: int):
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=s.status_msg.message_id,
-                        text=(
-                            f"🔎 *Live Results*\n\n"
-                            f"🔗 URLs: `{len(s.found_urls)}`\n"
-                            f"📝 Dork: `{s.current_dork}/{s.total_dorks}`\n"
-                            f"⚡ Speed: `{s.config.requests_per_second}` req/s"
-                        ),
+                        text=f"🔎 *Live Results*\n\n"
+                             f"🔗 URLs: `{len(s.found_urls)}`\n"
+                             f"📝 Dork: `{s.current_dork}/{s.total_dorks}`\n"
+                             f"⚡ Proxies alive: `{sum(w.is_healthy for w in scraper.workers)}`/{len(scraper.workers)}",
                         parse_mode="Markdown"
                     )
-                except:
-                    pass
+                except: pass
     finally:
         await scraper.stop()
 
@@ -594,10 +575,7 @@ async def run_scan(context, uid: int, chat_id: int):
     buf = BytesIO(content.encode("utf-8"))
     buf.name = f"yahoo_results_{int(time.time())}.txt"
     await context.bot.send_message(
-        chat_id,
-        f"✅ *Scan Complete!*\n\n"
-        f"🔗 Total URLs: `{len(urls)}`\n"
-        f"📝 Dorks processed: `{s.current_dork}/{s.total_dorks}`",
+        chat_id, f"✅ *Scan Complete!*\n\n🔗 Total URLs: `{len(urls)}`",
         parse_mode="Markdown"
     )
     await context.bot.send_document(chat_id, document=buf, filename=buf.name)
@@ -626,13 +604,15 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("pages", set_pages))
     app.add_handler(CommandHandler("speed", set_speed))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(CommandHandler("setproxies", set_proxies_cmd))
+    app.add_handler(CommandHandler("checkproxies", check_proxies_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_dork_file))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    logger.info("🚀 Yahoo Dork Parser (curl_cffi pure async) bot running...")
+    logger.info("🚀 Yahoo Fixed Proxy Bot (with auto checker) running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
