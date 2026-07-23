@@ -12,7 +12,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------- CONFIG --------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI")
 MAX_CONCURRENT_PER_PROXY = 5
 DEFAULT_PAGES = 3
 DEFAULT_SPEED = 1.0          # requests/sec per proxy (0.5–2.0)
