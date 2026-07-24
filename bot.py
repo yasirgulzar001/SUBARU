@@ -40,6 +40,9 @@ from telegram.ext import (
     filters,
 )
 
+# ⚠️ Bot token hardcoded – do NOT share this file publicly
+BOT_TOKEN = "8939889745:AAEFORAmnxmL48jGS7hzxOjnQaAGW9MejLI"
+
 # ──────────────────────────────────────────────────────────────
 #  Logging Configuration
 # ──────────────────────────────────────────────────────────────
@@ -692,7 +695,7 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     s = state.scanner.get_status()
-    pct = s["dorks_done"] / s["dorks_total"] * 100 if s["dorks_total"] else 0
+    pct = s['dorks_done'] / s['dorks_total'] * 100 if s['dorks_total'] else 0
     await update.message.reply_text(
         f"📊 *Scan Status*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -805,10 +808,8 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception: pass
 
 def main() -> None:
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("ERROR: BOT_TOKEN environment variable is not set.\nGet a token from @BotFather and run:\n  export BOT_TOKEN=your_token_here")
-        return
+    # Token is now hardcoded – no longer pulled from environment
+    token = BOT_TOKEN
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("help", cmd_help))
